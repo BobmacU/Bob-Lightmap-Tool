@@ -7,9 +7,9 @@
 <img width="849" height="837" alt="Screenshot 2025-12-27 154152" src="https://github.com/user-attachments/assets/cecf8842-fde1-418d-9f39-48ff61b7612d" />
 
 ## 🎯 What Is This?
-This is a Python tool for assist with getting Unity's lightmap to work and apply with the diffuse textures for lightmapped textures. 
+This is a Python tool for helping with getting Unity's lightmap to work and apply the diffuse textures to lightmapped textures. 
 This is not only for Garry's Mod. But, Can be used everywhere you need. The tool is not perfect but..
-I'd be very appreciate if someone who know the Unity lightmap pipeline correct some stuff as this tool is not **perfect**. So, feel free to fork it and fix it or make your own tool.
+I'd be very appreciate if someone who know the Unity lightmap pipeline could correct some stuff as this tool is not **perfect**. So, feel free to fork it and fix it or make your own tool.
 
 ---
 
@@ -57,7 +57,7 @@ That's it. It's simple tool. But, as I've mentioned above. **Feel free to fork t
 
 ## Known issues & wanted features.
 
-- Sometimes, the result won't be accurate to the Unity. Depending on color space or something that I'm not sure as I'm not a Unity user. BUt, You can tweak tonemapping to match it much as you can.
+- Sometimes, the result won't be accurate to the Unity. Depending on color space or something that I'm not sure as I'm not a Unity user. But, You can tweak tonemapping to match it much as you can.
 - GPU acceleration might have the same speed as CPU acceleration.
 - Applied results sometimes get artifacts. I fixed it as I can but still. some artifacts.
 - HDR & EXR support needed!
