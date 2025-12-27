@@ -25,6 +25,22 @@ I'd be very appreciate if someone who know the Unity lightmap pipeline correct s
 📷 Preview : A function for previewing the result before applying. Only for lightmap applying.
 ```
 
+## 🔒 Requirements
+
+Pillow 9.0.0
+numpy 1.23.0
+imageio 2.25.0
+Pytorch **(For GPU-Acceleration but optional)**
+
+**Run these in terminal to install them.**
+```yaml
+pip install Pillow==9.0.0 numpy==1.23.0 imageio==2.25.0
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+```
+**For PyTorch**
+You should install the one that matches your GPU's CUDA version.
+Run **nvidia-smi** in the terminal and check it.
+
 ## 🔨 Usage
 **For cropping lightmaps**
 
