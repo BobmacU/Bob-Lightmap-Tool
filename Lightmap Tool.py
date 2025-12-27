@@ -813,7 +813,6 @@ class LightmapApp:
         self.tonemap_choice = StringVar(value="Reinhard")
         self.tonemap_strength_var = DoubleVar(value=100.0)  # 0..100 blending of tonemap
         self.tonemap_exposure_var = DoubleVar(value=0.0)    # exposure in stops
-        self.tonemap_apply_on_save = IntVar(value=1)
         # Unity multiply option removed — keep pipeline defaults
         self._preview_debounce_after = None
 
@@ -941,24 +940,7 @@ class LightmapApp:
             self.crop_image_path = p
             self.crop_loaded_label.config(text=f"Loaded: {Path(p).name}")
             self.log(f"[Crop] Selected lightmap: {p}")
-            # auto-detect crop region (supports HDR/EXR)
-            try:
-                is_hdr, data = _load_any_image(Path(p))
-                if is_hdr:
-                    h = data.shape[0]; w = data.shape[1]
-                else:
-                    img = data if isinstance(data, Image.Image) else Image.open(p)
-                    w, h = img.size
-                tile_x = float(self.crop_scalx.get()); tile_y = float(self.crop_scaly.get())
-                off_x = float(self.crop_offx.get()); off_y = float(self.crop_offy.get())
-                left = int(off_x * w); top = int((1 - off_y - tile_y) * h)
-                right = int((off_x + tile_x) * w); bottom = int((1 - off_y) * h)
-                left = max(0,left); top=max(0,top); right=min(w,right); bottom=min(h,bottom)
-                cw = max(1, right-left); ch = max(1, bottom-top)
-                self.crop_out_w_var.set(str(cw)); self.crop_out_h_var.set(str(ch))
-                self.log(f"[Crop] Detected crop region {cw}x{ch}")
-            except Exception as e:
-                self.log(f"[Crop] autofill failed: {e}")
+            # Auto-detect autofill for crop region removed — user will set sizes manually.
 
     def _crop_pick_output_folder(self):
         p = filedialog.askdirectory()
@@ -1027,8 +1009,7 @@ class LightmapApp:
         tonemenu = OptionMenu(left, self.tonemap_choice, "Reinhard", "ACES", "None")
         tonemenu.config(bg=self.entry_bg, fg=self.fg)
         tonemenu.pack(fill=X, padx=padx, pady=4)
-        cb_tm = Checkbutton(left, text="Apply tonemap when saving LDR outputs", bg=self.bg, fg=self.fg, variable=self.tonemap_apply_on_save, onvalue=1, offvalue=0, selectcolor="#000000")
-        cb_tm.pack(anchor="w", padx=16, pady=4)
+        # Tonemap on-save option always enabled by default (UI control removed)
         add_label(left, "Tonemap Strength (0 - 100) — blend between original and tonemapped")
         strength_slider = Scale(left, from_=0, to=100, orient=HORIZONTAL, variable=self.tonemap_strength_var, bg=self.bg, fg=self.fg, troughcolor=self.entry_bg, highlightthickness=0)
         strength_slider.set(100); strength_slider.pack(fill=X, padx=padx, pady=4)
@@ -1317,10 +1298,11 @@ class LightmapApp:
                         # LDR output requested
                         strength = float(self.tonemap_strength_var.get())/100.0 if hasattr(self, 'tonemap_strength_var') else 1.0
                         exposure = float(self.tonemap_exposure_var.get()) if hasattr(self, 'tonemap_exposure_var') else 0.0
-                        if bool(self.tonemap_apply_on_save.get()):
+                        # Always apply tonemap for LDR outputs
+                        try:
                             pil_out = _apply_tonemap_to_image(result_img, method=self.tonemap_choice.get(), strength=strength, exposure=exposure)
-                        else:
-                            # simple clamp + linear->sRGB
+                        except Exception:
+                            # fallback to simple clamp + linear->sRGB
                             rgb = result_img[..., :3]
                             srgb = _linear_to_srgb_np(np.clip(rgb, 0.0, None))
                             a = result_img[..., 3:4] if result_img.shape[2] > 3 else np.ones((result_img.shape[0], result_img.shape[1], 1), dtype=np.float32)
@@ -1338,29 +1320,22 @@ class LightmapApp:
                         res = getattr(Image, "Resampling", Image).LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
                         result_img = result_img.resize((out_w, out_h), res)
                     # If user requested tonemap on save, apply it even for PIL results
-                    if bool(self.tonemap_apply_on_save.get()):
-                        try:
-                            # convert PIL sRGB -> linear arr
-                            arr = (np.asarray(result_img).astype(np.float32) / 255.0)
-                            rgb = arr[..., :3]
-                            lin = _srgb_to_linear_np(rgb)
-                            if arr.shape[2] > 3:
-                                a = arr[..., 3:4]
-                                lin_a = np.concatenate([lin, a], axis=2)
-                            else:
-                                lin_a = np.concatenate([lin, np.ones((lin.shape[0], lin.shape[1], 1), dtype=np.float32)], axis=2)
-                            strength = float(self.tonemap_strength_var.get())/100.0 if hasattr(self, 'tonemap_strength_var') else 1.0
-                            exposure = float(self.tonemap_exposure_var.get()) if hasattr(self, 'tonemap_exposure_var') else 0.0
-                            pil_out = _apply_tonemap_to_image(lin_a, method=self.tonemap_choice.get(), strength=strength, exposure=exposure)
-                            pil_out.save(str(out_path))
-                            pil_for_cache = pil_out
-                        except Exception:
-                            try:
-                                _save_any_image(out_path, result_img)
-                            except Exception:
-                                result_img.save(str(out_path))
-                    else:
-                        # choose save helper so HDR paths are respected
+                    # Always apply tonemap on save for PIL results; fall back to direct save if tonemap fails
+                    try:
+                        arr = (np.asarray(result_img).astype(np.float32) / 255.0)
+                        rgb = arr[..., :3]
+                        lin = _srgb_to_linear_np(rgb)
+                        if arr.shape[2] > 3:
+                            a = arr[..., 3:4]
+                            lin_a = np.concatenate([lin, a], axis=2)
+                        else:
+                            lin_a = np.concatenate([lin, np.ones((lin.shape[0], lin.shape[1], 1), dtype=np.float32)], axis=2)
+                        strength = float(self.tonemap_strength_var.get())/100.0 if hasattr(self, 'tonemap_strength_var') else 1.0
+                        exposure = float(self.tonemap_exposure_var.get()) if hasattr(self, 'tonemap_exposure_var') else 0.0
+                        pil_out = _apply_tonemap_to_image(lin_a, method=self.tonemap_choice.get(), strength=strength, exposure=exposure)
+                        pil_out.save(str(out_path))
+                        pil_for_cache = pil_out
+                    except Exception:
                         try:
                             _save_any_image(out_path, result_img)
                         except Exception:
