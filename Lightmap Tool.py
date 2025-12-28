@@ -97,6 +97,19 @@ except Exception:
     iio = None
     IMAGEIO_AVAILABLE = False
 
+# OpenImageIO (preferred) -------------------------------------------------
+try:
+    import OpenImageIO as oiio
+    OIIO_AVAILABLE = True
+    OIIO_ERROR = None
+except Exception as e:
+    oiio = None
+    OIIO_AVAILABLE = False
+    OIIO_ERROR = str(e)
+
+# store metadata for loaded files so we can preserve original bit-depth on save
+LOADED_META = {}
+
 # Not using native OpenEXR bindings; prefer imageio for EXR/HDR handling
 OPENEXR_AVAILABLE = False
 OpenEXR = None
@@ -134,8 +147,12 @@ def _linear_to_srgb_np(arr):
 # Note: resample selection removed — code uses sensible defaults.
 
 def _is_hdr_ext(p: Path):
-    # HDR/EXR support is disabled — treat all files as LDR.
-    return False
+    # Treat common HDR/float/half formats as HDR
+    try:
+        ext = p.suffix.lower()
+        return ext in ('.exr', '.hdr', '.pfm', '.pfm', '.tif', '.tiff')
+    except Exception:
+        return False
 
 # OpenCV support detection removed: we force use of imageio for EXR/HDR.
 
@@ -203,18 +220,184 @@ def _load_any_image(path: Path):
     - if is_hdr True: `data` is a numpy.float32 array shape (H,W,4) in RGB(A) linear space (no gamma)
     - if is_hdr False: `data` is a PIL.Image instance (LDR)
     """
-    # HDR/EXR support removed: always return an LDR PIL Image (RGBA)
     p = Path(path)
-    img = Image.open(str(p)).convert('RGBA')
-    return False, img
+    # Prefer OpenImageIO when available for robust HDR / 16-bit / float handling
+    if OIIO_AVAILABLE:
+        try:
+            inp = oiio.ImageInput.open(str(p))
+            if not inp:
+                raise RuntimeError(f"OIIO failed to open {p}")
+            spec = inp.spec()
+            nchannels = spec.nchannels
+            # read as float
+            pixels = inp.read_image(oiio.FLOAT)
+            inp.close()
+            if pixels is None:
+                raise RuntimeError(f"OIIO failed to read pixels from {p}")
+            arr = np.array(pixels, copy=True)
+            # OIIO returns flat array; reshape to (H,W,C)
+            h = spec.height; w = spec.width
+            if nchannels == 0:
+                nchannels = 1
+            try:
+                arr = arr.reshape((h, w, nchannels))
+            except Exception:
+                # some readers return (C,H,W)
+                try:
+                    arr = arr.reshape((nchannels, h, w)).transpose(1,2,0)
+                except Exception:
+                    pass
+
+            # Determine source numeric type from spec.format basetype when available
+            fmt = None
+            try:
+                fmt = spec.get_format() if hasattr(spec, 'get_format') else getattr(spec, 'format', None)
+            except Exception:
+                fmt = getattr(spec, 'format', None)
+            basetype = getattr(fmt, 'basetype', None)
+            is_float_source = False
+            try:
+                if basetype == getattr(oiio, 'FLOAT', None) or basetype == getattr(oiio, 'HALF', None):
+                    is_float_source = True
+            except Exception:
+                pass
+            is_hdr = is_float_source or (p.suffix.lower() in ('.exr', '.hdr', '.pfm')) or (spec.getattribute('oiio:ColorSpace') == 'linear' if hasattr(spec, 'getattribute') else False)
+
+            # Ensure 4 channels (RGBA) for consistency
+            if arr.ndim == 2:
+                arr = np.expand_dims(arr, axis=2)
+            if arr.shape[2] == 1:
+                a = np.ones((h, w, 1), dtype=np.float32)
+                arr = np.concatenate([arr, a, a, a], axis=2)
+            if arr.shape[2] == 3:
+                a = np.ones((h, w, 1), dtype=np.float32)
+                arr = np.concatenate([arr, a], axis=2)
+
+            # If source was integer-based (not float/half), normalize by its integer range
+            try:
+                if not is_float_source:
+                    # if values are larger than 256, assume 16-bit (0..65535), otherwise 8-bit
+                    maxv = float(arr.max()) if arr.size > 0 else 0.0
+                    if maxv > 256.0:
+                        arr = arr.astype(np.float32) / 65535.0
+                    else:
+                        arr = arr.astype(np.float32) / 255.0
+                else:
+                    arr = arr.astype(np.float32)
+                # if not HDR, convert sRGB->linear
+                if not is_hdr:
+                    arr[..., :3] = _srgb_to_linear_np(np.clip(arr[..., :3], 0.0, 1.0))
+                # clamp alpha
+                arr[..., 3] = np.clip(arr[..., 3], 0.0, 1.0)
+            except Exception:
+                pass
+
+            # store metadata for potential roundtrip save (preserve basetype)
+            try:
+                LOADED_META[str(p.resolve())] = {'basetype': basetype, 'is_float_source': bool(is_float_source)}
+            except Exception:
+                pass
+
+            return bool(is_hdr), arr.astype(np.float32)
+        except Exception:
+            # fall through to PIL fallback silently
+            pass
+    # If OIIO isn't available or failed, try imageio (v3/v2) as a secondary loader for HDR/EXR
+    ext = p.suffix.lower()
+    hdr_exts = ('.exr', '.hdr', '.pfm', '.tif', '.tiff')
+    if IMAGEIO_AVAILABLE:
+        try:
+            arr = iio.imread(str(p))
+            arr = np.asarray(arr)
+            # Normalize integer ranges to 0..1
+            if arr.dtype != np.float32 and arr.dtype != np.float64:
+                arr = arr.astype(np.float32)
+                if arr.max() > 1.5:
+                    arr = arr / 255.0
+            # Ensure channel dims
+            if arr.ndim == 2:
+                arr = np.expand_dims(arr, axis=2)
+            h, w = arr.shape[0], arr.shape[1]
+            ch = arr.shape[2]
+            if ch == 1:
+                a = np.ones((h, w, 1), dtype=np.float32)
+                arr = np.concatenate([arr, a, a, a], axis=2)
+            if ch == 3:
+                a = np.ones((h, w, 1), dtype=np.float32)
+                arr = np.concatenate([arr, a], axis=2)
+            # assume linear for true HDR extensions; otherwise convert sRGB->linear
+            is_hdr = ext in hdr_exts
+            if not is_hdr:
+                try:
+                    arr[..., :3] = _srgb_to_linear_np(np.clip(arr[..., :3], 0.0, 1.0))
+                except Exception:
+                    pass
+            return bool(is_hdr), arr.astype(np.float32)
+        except Exception:
+            # imageio failed - continue to PIL fallback silently
+            pass
+
+    # fallback: use PIL for LDR images. For HDR/EXR types, raise a clear error requesting OIIO
+    if ext in hdr_exts and not OIIO_AVAILABLE:
+        raise RuntimeError(f"Cannot load HDR/EXR file {p.name} without OpenImageIO.\nInstall OpenImageIO into the Python you run the app with, or launch the app with the Python that has OpenImageIO installed. Click 'Refresh OIIO' after installing.")
+
+    try:
+        img = Image.open(str(p)).convert('RGBA')
+        return False, img
+    except Exception as e:
+        # re-raise with helpful message
+        raise RuntimeError(f"Failed to open image {p}: {e}")
 
 
-def _resize_rgba_premult(pil_img: Image.Image, size):
+def _resize_rgba_premult(pil_img: Image.Image, size, filtername: str = 'lanczos3'):
     """Resize an RGBA PIL image using premultiplied-alpha to avoid halos.
     Falls back to normal resize if NumPy not available.
     Returns a PIL.Image (RGBA).
     """
     resample = getattr(Image, 'Resampling', Image).LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS
+    # If OIIO available and NumPy present, perform high-quality resizing in linear float domain
+    if OIIO_AVAILABLE and NUMPY_AVAILABLE and np is not None:
+        try:
+            arr = (np.asarray(pil_img).astype(np.float32) / 255.0)
+            if arr.ndim != 3 or arr.shape[2] not in (3,4):
+                return pil_img.resize(size, resample)
+            if arr.shape[2] == 3:
+                a = np.ones((arr.shape[0], arr.shape[1], 1), dtype=np.float32)
+                arr = np.concatenate([arr, a], axis=2)
+            rgb = arr[..., :3]
+            a = arr[..., 3:4]
+            # Convert sRGB->linear, premultiply, resize in linear via OIIO
+            lin_rgb = _srgb_to_linear_np(rgb)
+            a_for = np.where(a > 1e-6, a, 1.0)
+            premult = lin_rgb * a_for
+            in_arr = np.concatenate([premult, a_for], axis=2)
+            # try OIIO resize
+            try:
+                h0, w0 = in_arr.shape[0], in_arr.shape[1]
+                ch = in_arr.shape[2]
+                if ch not in (3,4):
+                    return pil_img.resize(size, resample)
+                src_spec = oiio.ImageSpec(w0, h0, ch, oiio.FLOAT)
+                src = oiio.ImageBuf(src_spec)
+                src.set_pixels(oiio.ROI(0, w0, 0, h0), in_arr.astype(np.float32).flatten().tolist())
+                dst_spec = oiio.ImageSpec(size[0], size[1], ch, oiio.FLOAT)
+                dst = oiio.ImageBuf(dst_spec)
+                oiio.ImageBufAlgo.resize(dst, src, filtername=filtername)
+                dst_pixels = dst.get_pixels(oiio.ROI(0, size[0], 0, size[1]), oiio.FLOAT)
+                dst_arr = np.array(dst_pixels, dtype=np.float32).reshape((size[1], size[0], ch))
+                res_a = dst_arr[..., 3:4]
+                eps = 1e-6
+                res_rgb_lin = np.where(res_a > eps, dst_arr[..., :3] / np.maximum(res_a, eps), 0.0)
+                # convert linear->sRGB for PIL output
+                res_rgb_srgb = _linear_to_srgb_np(np.clip(res_rgb_lin, 0.0, 1.0))
+                out = np.concatenate([res_rgb_srgb, res_a], axis=2)
+                return Image.fromarray((np.clip(out, 0.0, 1.0) * 255.0).round().astype(np.uint8), mode='RGBA')
+            except Exception as e:
+                print(f"[_resize_rgba_premult] OIIO resize failed: {e}")
+                # fallback to PIL path below
+                pass
+        except Exception:
+            pass
     if not NUMPY_AVAILABLE or np is None:
         return pil_img.resize(size, resample)
     try:
@@ -239,16 +422,83 @@ def _resize_rgba_premult(pil_img: Image.Image, size):
     except Exception:
         return pil_img.resize(size, resample)
 
-def _save_any_image(path: Path, data):
+def _save_any_image(path: Path, data, src_meta_path: Path = None):
     p = Path(path)
-    # HDR/EXR support removed: save as standard LDR file via PIL.
+    # Prefer OIIO for saving when available to preserve bit-depth/format
+    if OIIO_AVAILABLE:
+        try:
+            # If data is PIL Image, convert to numpy float32 linear
+            if isinstance(data, Image.Image):
+                arr = (np.asarray(data).astype(np.float32) / 255.0)
+                # assume PIL is sRGB; convert to linear
+                arr[..., :3] = _srgb_to_linear_np(arr[..., :3])
+            else:
+                arr = data
+
+            h, w = arr.shape[0], arr.shape[1]
+            ch = arr.shape[2]
+            ext = p.suffix.lower()
+            if ext in ('.exr', '.hdr', '.pfm'):
+                # choose basetype according to source metadata if available
+                basetype = None
+                try:
+                    if src_meta_path is not None:
+                        meta = LOADED_META.get(str(Path(src_meta_path).resolve()), {})
+                        basetype = meta.get('basetype', None)
+                except Exception:
+                    basetype = None
+                # map basetype to oiio type: prefer original float/half if present
+                out_basetype = oiio.FLOAT
+                try:
+                    if basetype == getattr(oiio, 'HALF', None):
+                        out_basetype = getattr(oiio, 'HALF', oiio.FLOAT)
+                    elif basetype == getattr(oiio, 'FLOAT', None):
+                        out_basetype = getattr(oiio, 'FLOAT', oiio.FLOAT)
+                except Exception:
+                    out_basetype = oiio.FLOAT
+                out_spec = oiio.ImageSpec(w, h, ch, out_basetype)
+                out = oiio.ImageOutput.create(str(p))
+                if not out:
+                    raise RuntimeError(f"OIIO failed to create output for {p}")
+                out.open(str(p), out_spec)
+                out.write_image(arr.astype(np.float32).flatten().tolist())
+                out.close()
+                return
+            elif ext in ('.tif', '.tiff'):
+                out_spec = oiio.ImageSpec(w, h, ch, oiio.UINT16)
+                arr_to_write = np.clip(arr, 0.0, 1.0)
+                arr_to_write = (arr_to_write * 65535.0).round().astype(np.uint16)
+                out = oiio.ImageOutput.create(str(p))
+                if not out:
+                    raise RuntimeError(f"OIIO failed to create output for {p}")
+                out.open(str(p), out_spec)
+                out.write_image(arr_to_write.flatten().tolist())
+                out.close()
+                return
+            else:
+                # LDR PNG/JPEG: convert linear->sRGB 0..255 uint8
+                arr_to_write = np.clip(_linear_to_srgb_np(np.clip(arr[..., :3], 0.0, 1.0)), 0.0, 1.0)
+                alpha = np.clip(arr[..., 3:4], 0.0, 1.0) if ch > 3 else np.ones((h, w, 1), dtype=np.float32)
+                rgba = np.concatenate([arr_to_write, alpha], axis=2)
+                arr_to_write = (rgba * 255.0).round().astype(np.uint8)
+                out_spec = oiio.ImageSpec(w, h, rgba.shape[2], oiio.UINT8)
+                out = oiio.ImageOutput.create(str(p))
+                if not out:
+                    raise RuntimeError(f"OIIO failed to create output for {p}")
+                out.open(str(p), out_spec)
+                out.write_image(arr_to_write.flatten().tolist())
+                out.close()
+                return
+        except Exception:
+            # fall through to PIL fallback
+            pass
+
+    # fallback: use PIL
     if isinstance(data, Image.Image):
         data.save(str(p))
         return
-    # numpy array -> PIL
     arr = data
-    # assume linear float32 0..1 or uint8 0..255
-    if arr.dtype == np.float32 or arr.dtype == np.float64:
+    if isinstance(arr, np.ndarray) and (arr.dtype == np.float32 or arr.dtype == np.float64):
         img = Image.fromarray((np.clip(arr, 0.0, 1.0) * 255.0).round().astype(np.uint8), mode='RGBA')
     else:
         img = Image.fromarray(arr.astype(np.uint8), mode='RGBA')
@@ -299,7 +549,7 @@ class LightmapCropper:
             out_dir = s.output_dir or (Path(path).parent / "Cropped")
             os.makedirs(out_dir, exist_ok=True)
             out_path = Path(out_dir) / s.output_name
-            _save_any_image(out_path, cropped)
+            _save_any_image(out_path, cropped, src_meta_path=Path(path))
             return out_path
         else:
             img = data if isinstance(data, Image.Image) else Image.open(path)
@@ -342,7 +592,7 @@ def _compose_linear_torch(b, l, mode, intensity):
     return b * (1.0 - intensity) + comp * intensity
 
 def compose_images(base_img: Image.Image, layer_img: Image.Image, mode: str, intensity: float,
-                   use_linear: bool, use_torch: bool) -> Image.Image:
+                   use_linear: bool, use_torch: bool, resample_filter: str = 'lanczos3') -> Image.Image:
     """
     Compose two RGBA images. Diffuse is the top layer (layer_img). Lightmap is base_img.
     This function ensures base and layer sizes match (resizing base to match layer if needed).
@@ -354,7 +604,7 @@ def compose_images(base_img: Image.Image, layer_img: Image.Image, mode: str, int
     layer = layer_img.convert("RGBA")
     if base.size != layer.size:
         # resize base to match layer using premultiplied-alpha to avoid halos
-        base = _resize_rgba_premult(base, layer.size)
+        base = _resize_rgba_premult(base, layer.size, filtername=resample_filter)
 
     W, H = base.size
     total_pixels = W * H
@@ -562,7 +812,7 @@ def compose_files_to_image(diffuse_path: Path, lightmap_path: Path, mode: str = 
                            use_linear: bool = False, treat_lm_as_linear: bool = False,
                            diffuse_over_lm: bool = False, use_torch: bool = False,
                            srgb_multiply: bool = False,
-                           ):
+                           resample_filter: str = 'lanczos3'):
     """
     Compose files: diffuse (top) and lightmap (base).
     - resize_lm_to_diffuse: whether to scale the lightmap to match the diffuse
@@ -574,17 +824,44 @@ def compose_files_to_image(diffuse_path: Path, lightmap_path: Path, mode: str = 
         diffuse = Image.open(diffuse_path).convert("RGBA")
         lm = Image.open(lightmap_path).convert("RGBA")
         if resize_lm_to_diffuse:
-            lm = _resize_rgba_premult(lm, diffuse.size)
+            lm = _resize_rgba_premult(lm, diffuse.size, filtername=resample_filter)
         if diffuse_over_lm:
             return compose_images(diffuse, lm, mode.lower(), intensity, use_linear, use_torch)
         return compose_images(lm, diffuse, mode.lower(), intensity, use_linear, use_torch)
 
-    # Load as PIL then convert to float32 linear arrays
-    diff_img = Image.open(diffuse_path).convert('RGBA')
-    lm_img = Image.open(lightmap_path).convert('RGBA')
-
-    d_arr = (np.asarray(diff_img).astype(np.float32) / 255.0)
-    l_arr = (np.asarray(lm_img).astype(np.float32) / 255.0)
+    # Load images. Prefer OIIO-backed loader which returns linear float32 arrays
+    try:
+        if OIIO_AVAILABLE:
+            diff_is_hdr, d_data = _load_any_image(Path(diffuse_path))
+            lm_is_hdr, l_data = _load_any_image(Path(lightmap_path))
+            # d_data / l_data may be either PIL.Image (fallback) or numpy float32 arrays from OIIO
+            if isinstance(d_data, Image.Image):
+                diff_img = d_data.convert('RGBA')
+                d_arr = (np.asarray(diff_img).astype(np.float32) / 255.0)
+                d_from_oiio = False
+            else:
+                d_arr = d_data
+                d_from_oiio = True
+            if isinstance(l_data, Image.Image):
+                lm_img = l_data.convert('RGBA')
+                l_arr = (np.asarray(lm_img).astype(np.float32) / 255.0)
+                l_from_oiio = False
+            else:
+                l_arr = l_data
+                l_from_oiio = True
+        else:
+            diff_img = Image.open(diffuse_path).convert('RGBA')
+            lm_img = Image.open(lightmap_path).convert('RGBA')
+            d_arr = (np.asarray(diff_img).astype(np.float32) / 255.0)
+            l_arr = (np.asarray(lm_img).astype(np.float32) / 255.0)
+            d_from_oiio = False; l_from_oiio = False
+    except Exception:
+        # worst-case: fallback to PIL
+        diff_img = Image.open(diffuse_path).convert('RGBA')
+        lm_img = Image.open(lightmap_path).convert('RGBA')
+        d_arr = (np.asarray(diff_img).astype(np.float32) / 255.0)
+        l_arr = (np.asarray(lm_img).astype(np.float32) / 255.0)
+        d_from_oiio = False; l_from_oiio = False
 
     # ensure alpha channel exists
     if d_arr.shape[2] == 3:
@@ -592,11 +869,12 @@ def compose_files_to_image(diffuse_path: Path, lightmap_path: Path, mode: str = 
     if l_arr.shape[2] == 3:
         l_arr = np.concatenate([l_arr, np.ones((l_arr.shape[0], l_arr.shape[1], 1), dtype=np.float32)], axis=2)
 
-    # Convert sRGB -> linear for diffuse and lightmap
-    # (we always convert the loaded 8-bit lightmap to linear space; resizing is done
-    #  via a premultiplied sRGB round-trip to avoid halos while preserving color)
-    d_arr[..., :3] = _srgb_to_linear_np(d_arr[..., :3])
-    l_arr[..., :3] = _srgb_to_linear_np(l_arr[..., :3])
+    # Convert sRGB -> linear for diffuse and lightmap only when needed.
+    # If arrays were loaded via OIIO they are already linear floats.
+    if not (isinstance(d_arr, np.ndarray) and d_from_oiio):
+        d_arr[..., :3] = _srgb_to_linear_np(d_arr[..., :3])
+    if not (isinstance(l_arr, np.ndarray) and l_from_oiio):
+        l_arr[..., :3] = _srgb_to_linear_np(l_arr[..., :3])
 
     # Bleed / fill transparent texels on the lightmap using a nearest-source fill
     # (multi-source BFS). This preserves the exact color of the nearest opaque texel
@@ -648,38 +926,74 @@ def compose_files_to_image(diffuse_path: Path, lightmap_path: Path, mode: str = 
     Hd, Wd = d_arr.shape[0], d_arr.shape[1]
     Hl, Wl = l_arr.shape[0], l_arr.shape[1]
     if resize_lm_to_diffuse and (Wd != Wl or Hd != Hl):
-        # Resize the lightmap using a premultiplied sRGB round-trip to avoid halos
-        # while preserving linear color correctness.
-        resample = getattr(Image, 'Resampling', Image).LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS
-        try:
-            # Convert linear->sRGB for accurate byte-domain resampling
-            sRGB = _linear_to_srgb_np(np.clip(l_arr[..., :3], 0.0, 1.0))
-            a = np.clip(l_arr[..., 3:4], 0.0, 1.0)
-            # For resizing, use a temporary alpha that treats transparent
-            # pixels as opaque (alpha=1.0) so the premultiplied resample
-            # retains nearby colors and avoids halos. We do NOT write this
-            # fake alpha back to `l_arr` — `l_arr` keeps the original alpha
-            # (see _bleed_fill). This prevents the lightmap from leaking
-            # influence across the whole texture during composition.
-            a_for_premult = np.where(a > 1e-6, a, 1.0)
-            premult = sRGB * a_for_premult
-            rgba = np.concatenate([premult, a_for_premult], axis=2)
-            tmp = Image.fromarray((np.clip(rgba, 0.0, 1.0) * 255.0).round().astype(np.uint8), mode='RGBA')
-            tmp = tmp.resize((Wd, Hd), resample)
-            res = (np.asarray(tmp).astype(np.float32) / 255.0)
-            res_a = res[..., 3:4]
-            eps = 1e-6
-            res_rgb_srgb = np.where(res_a > eps, res[..., :3] / np.maximum(res_a, eps), 0.0)
-            # convert back sRGB->linear
-            res_rgb_lin = _srgb_to_linear_np(np.clip(res_rgb_srgb, 0.0, 1.0))
-            l_arr = np.concatenate([res_rgb_lin, res_a], axis=2)
-        except Exception:
-            # fallback to simple resize (less ideal)
-            tmp_rgb = Image.fromarray((np.clip(l_arr[..., :3], 0.0, 1.0) * 255.0).round().astype(np.uint8), mode='RGB')
-            tmp_a = Image.fromarray((np.clip(l_arr[..., 3]*255.0, 0, 255).round().astype(np.uint8)), mode='L')
-            tmp_rgb.putalpha(tmp_a)
-            tmp_rgb = tmp_rgb.resize((Wd, Hd), resample)
-            l_arr = (np.asarray(tmp_rgb).astype(np.float32) / 255.0)
+        # Prefer performing the resize in linear float domain using OIIO when available.
+        if OIIO_AVAILABLE and NUMPY_AVAILABLE and np is not None:
+            try:
+                h0, w0 = l_arr.shape[0], l_arr.shape[1]
+                ch = l_arr.shape[2]
+                a = np.clip(l_arr[..., 3:4], 0.0, 1.0)
+                a_for = np.where(a > 1e-6, a, 1.0)
+                premult = l_arr[..., :3] * a_for
+                in_arr = np.concatenate([premult, a_for], axis=2)
+                src_spec = oiio.ImageSpec(w0, h0, in_arr.shape[2], oiio.FLOAT)
+                src = oiio.ImageBuf(src_spec)
+                src.set_pixels(oiio.ROI(0, w0, 0, h0), in_arr.astype(np.float32).flatten().tolist())
+                dst_spec = oiio.ImageSpec(Wd, Hd, in_arr.shape[2], oiio.FLOAT)
+                dst = oiio.ImageBuf(dst_spec)
+                oiio.ImageBufAlgo.resize(dst, src, filtername=resample_filter)
+                dst_pixels = dst.get_pixels(oiio.ROI(0, Wd, 0, Hd), oiio.FLOAT)
+                dst_arr = np.array(dst_pixels, dtype=np.float32).reshape((Hd, Wd, in_arr.shape[2]))
+                res_a = dst_arr[..., 3:4]
+                eps = 1e-6
+                res_rgb_lin = np.where(res_a > eps, dst_arr[..., :3] / np.maximum(res_a, eps), 0.0)
+                l_arr = np.concatenate([res_rgb_lin, res_a], axis=2)
+            except Exception as e:
+                print(f"[compose_files_to_image] OIIO resize failed: {e}")
+                # fallback to the PIL-based resize below
+                resample = getattr(Image, 'Resampling', Image).LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS
+                try:
+                    sRGB = _linear_to_srgb_np(np.clip(l_arr[..., :3], 0.0, 1.0))
+                    a = np.clip(l_arr[..., 3:4], 0.0, 1.0)
+                    a_for_premult = np.where(a > 1e-6, a, 1.0)
+                    premult = sRGB * a_for_premult
+                    rgba = np.concatenate([premult, a_for_premult], axis=2)
+                    tmp = Image.fromarray((np.clip(rgba, 0.0, 1.0) * 255.0).round().astype(np.uint8), mode='RGBA')
+                    tmp = tmp.resize((Wd, Hd), resample)
+                    res = (np.asarray(tmp).astype(np.float32) / 255.0)
+                    res_a = res[..., 3:4]
+                    eps = 1e-6
+                    res_rgb_srgb = np.where(res_a > eps, res[..., :3] / np.maximum(res_a, eps), 0.0)
+                    res_rgb_lin = _srgb_to_linear_np(np.clip(res_rgb_srgb, 0.0, 1.0))
+                    l_arr = np.concatenate([res_rgb_lin, res_a], axis=2)
+                except Exception:
+                    tmp_rgb = Image.fromarray((np.clip(l_arr[..., :3], 0.0, 1.0) * 255.0).round().astype(np.uint8), mode='RGB')
+                    tmp_a = Image.fromarray((np.clip(l_arr[..., 3]*255.0, 0, 255).round().astype(np.uint8)), mode='L')
+                    tmp_rgb.putalpha(tmp_a)
+                    tmp_rgb = tmp_rgb.resize((Wd, Hd), resample)
+                    l_arr = (np.asarray(tmp_rgb).astype(np.float32) / 255.0)
+        else:
+            # OIIO not available — use PIL round-trip as before
+            resample = getattr(Image, 'Resampling', Image).LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS
+            try:
+                sRGB = _linear_to_srgb_np(np.clip(l_arr[..., :3], 0.0, 1.0))
+                a = np.clip(l_arr[..., 3:4], 0.0, 1.0)
+                a_for_premult = np.where(a > 1e-6, a, 1.0)
+                premult = sRGB * a_for_premult
+                rgba = np.concatenate([premult, a_for_premult], axis=2)
+                tmp = Image.fromarray((np.clip(rgba, 0.0, 1.0) * 255.0).round().astype(np.uint8), mode='RGBA')
+                tmp = tmp.resize((Wd, Hd), resample)
+                res = (np.asarray(tmp).astype(np.float32) / 255.0)
+                res_a = res[..., 3:4]
+                eps = 1e-6
+                res_rgb_srgb = np.where(res_a > eps, res[..., :3] / np.maximum(res_a, eps), 0.0)
+                res_rgb_lin = _srgb_to_linear_np(np.clip(res_rgb_srgb, 0.0, 1.0))
+                l_arr = np.concatenate([res_rgb_lin, res_a], axis=2)
+            except Exception:
+                tmp_rgb = Image.fromarray((np.clip(l_arr[..., :3], 0.0, 1.0) * 255.0).round().astype(np.uint8), mode='RGB')
+                tmp_a = Image.fromarray((np.clip(l_arr[..., 3]*255.0, 0, 255).round().astype(np.uint8)), mode='L')
+                tmp_rgb.putalpha(tmp_a)
+                tmp_rgb = tmp_rgb.resize((Wd, Hd), resample)
+                l_arr = (np.asarray(tmp_rgb).astype(np.float32) / 255.0)
 
     # Normalize intensity (0.0..1.0). Do NOT directly darken the lightmap RGB here;
     # the compose step should use the lightmap alpha scaled by intensity so
@@ -781,7 +1095,7 @@ def apply_lightmap_to_diffuse(diffuse_path: Path, lightmap_path: Path, out_path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     # result may be a numpy float32 array (HDR) or a PIL.Image (LDR)
     if isinstance(result, np.ndarray):
-        _save_any_image(out_path, result)
+        _save_any_image(out_path, result, src_meta_path=lightmap_path)
     else:
         result.save(str(out_path))
     return out_path, result
@@ -808,6 +1122,8 @@ class LightmapApp:
         self.use_torch_var = IntVar(value=1 if TORCH_AVAILABLE else 0)
         self.use_linear_var = IntVar(value=1)  # default to linear pipeline (physically-correct)
         self.resize_var = IntVar(value=1)
+        # default to friendly label; UI maps friendly label -> OIIO filter
+        self.resampler_var = StringVar(value='Lanczos (3)')
         self.mode_var = StringVar(value="multiply")
         self.intensity_var = DoubleVar(value=100.0)  # 0..100 for slider
         self.tonemap_choice = StringVar(value="Reinhard")
@@ -935,7 +1251,7 @@ class LightmapApp:
         add_button("CROP LIGHTMAP", self._do_crop, color="#4CAF50", hover="#66bb6a")
 
     def _crop_pick_lightmap(self):
-        p = filedialog.askopenfilename(filetypes=[("Images", "*.png;*.jpg;*.tga;*.bmp")])
+        p = filedialog.askopenfilename(filetypes=[("Images", "*.png;*.jpg;*.tga;*.bmp;*.exr;*.hdr;*.pfm;*.tif;*.tiff"), ("All Files", "*")])
         if p:
             self.crop_image_path = p
             self.crop_loaded_label.config(text=f"Loaded: {Path(p).name}")
@@ -976,6 +1292,8 @@ class LightmapApp:
     def _build_apply_tab(self, parent):
         container, frame = self._make_scrollable(parent)
         padx = 8; pady = 6
+
+        # OIIO runtime detection / UI removed per user preference
 
         def add_label_bold(p, text):
             lbl = Label(p, text=text, bg=self.bg, fg=self.fg, font=("Segoe UI", 10, "bold"))
@@ -1023,6 +1341,24 @@ class LightmapApp:
         torch_cb = Checkbutton(left, text=torch_text, bg=self.bg, fg=self.fg, variable=self.use_torch_var, onvalue=1, offvalue=0, selectcolor="#000000")
         torch_cb.pack(anchor="w", padx=16, pady=4)
 
+        add_label(left, "Resampler (used for linear-space resizing)")
+        # friendly labels mapped to OIIO filter names
+        res_options = {
+            'Lanczos (3)': 'lanczos3',
+            'Sinc': 'sinc',
+            'Blackman-Harris': 'blackman-harris',
+            'Mitchell': 'mitchell',
+            'Gaussian': 'gaussian',
+            'Box': 'box',
+            'Triangle': 'triangle'
+        }
+        # store map friendly label -> filtername
+        self._resampler_map = res_options
+        # present friendly names in the menu
+        res_menu = OptionMenu(left, self.resampler_var, *list(res_options.keys()))
+        res_menu.config(bg=self.entry_bg, fg=self.fg)
+        res_menu.pack(fill=X, padx=padx, pady=4)
+
         resize_chk = Checkbutton(left, text="Resize lightmap to diffuse size before composing", bg=self.bg, fg=self.fg, variable=self.resize_var, onvalue=1, offvalue=0, selectcolor="#000000")
         resize_chk.pack(anchor="w", padx=16, pady=2)
         # (Unity multiply checkbox removed)
@@ -1049,13 +1385,13 @@ class LightmapApp:
         self.preview_result_label = Label(right, bg=self.bg); self.preview_result_label.pack(padx=6, pady=6)
 
     def _apply_pick_diffuse(self):
-        p = filedialog.askopenfilename(filetypes=[("Images", "*.png;*.jpg;*.tga;*.bmp")])
+        p = filedialog.askopenfilename(filetypes=[("Images", "*.png;*.jpg;*.tga;*.bmp;*.exr;*.hdr;*.pfm;*.tif;*.tiff"), ("All Files", "*")])
         if p:
             self.diffuse_path = p; self.apply_diffuse_label.config(text=f"Loaded: {Path(p).name}"); self.log(f"[Apply] Selected diffuse: {p}")
             self._update_preview_thumb(self.preview_diffuse_label, p)
 
     def _apply_pick_lightmap(self):
-        p = filedialog.askopenfilename(filetypes=[("Images", "*.png;*.jpg;*.tga;*.bmp")])
+        p = filedialog.askopenfilename(filetypes=[("Images", "*.png;*.jpg;*.tga;*.bmp;*.exr;*.hdr;*.pfm;*.tif;*.tiff"), ("All Files", "*")])
         if p:
             self.lm_path = p; self.apply_lm_label.config(text=f"Loaded: {Path(p).name}"); self.log(f"[Apply] Selected lightmap: {p}")
             self._update_preview_thumb(self.preview_lm_label, p)
@@ -1170,7 +1506,7 @@ class LightmapApp:
 
                 d_preview.thumbnail((max_dim, max_dim))
                 if resize_flag:
-                    l_preview = _resize_rgba_premult(l_preview, d_preview.size)
+                    l_preview = _resize_rgba_premult(l_preview, d_preview.size, filtername=self._resampler_map.get(self.resampler_var.get(), 'lanczos3'))
                 else:
                     l_preview.thumbnail((max_dim, max_dim))
                 d_img = d_preview
@@ -1180,7 +1516,7 @@ class LightmapApp:
                 lm_img = Image.open(self.lm_path).convert("RGBA")
                 d_img.thumbnail((max_dim, max_dim))
                 if resize_flag:
-                    lm_img = _resize_rgba_premult(lm_img, d_img.size)
+                    lm_img = _resize_rgba_premult(lm_img, d_img.size, filtername=self._resampler_map.get(self.resampler_var.get(), 'lanczos3'))
                 else:
                     lm_img.thumbnail((max_dim, max_dim))
 
@@ -1194,7 +1530,7 @@ class LightmapApp:
             # compute key and cache check
             key = self._make_preview_key(self.diffuse_path, self.lm_path, mode, intensity, resize_flag, use_linear, use_torch)
             # always compute preview with fast path (torch/numpy) — it's downscaled so should be quick
-            result_img = compose_images(base, layer, mode, intensity, use_linear, use_torch)
+            result_img = compose_images(base, layer, mode, intensity, use_linear, use_torch, resample_filter=self._resampler_map.get(self.resampler_var.get(), 'lanczos3'))
             # If user selected a tonemap for preview, apply it (compose_images returns sRGB PIL)
             try:
                 method = self.tonemap_choice.get()
@@ -1266,12 +1602,13 @@ class LightmapApp:
 
                 if not use_cache:
                     # compose at full-res
-                    result_img = compose_files_to_image(Path(self.diffuse_path), Path(self.lm_path),
-                                                           mode=mode, intensity=float(intensity),
-                                                           resize_lm_to_diffuse=resize_flag,
-                                                           use_linear=use_linear,
-                                                           diffuse_over_lm=False, use_torch=use_torch,
-                                                           srgb_multiply=False)
+                        result_img = compose_files_to_image(Path(self.diffuse_path), Path(self.lm_path),
+                                                               mode=mode, intensity=float(intensity),
+                                                               resize_lm_to_diffuse=resize_flag,
+                                                               use_linear=use_linear,
+                                                               diffuse_over_lm=False, use_torch=use_torch,
+                                                               srgb_multiply=False,
+                                                               resample_filter=self._resampler_map.get(self.resampler_var.get(), 'lanczos3'))
 
                 # resize and save output (handle HDR numpy array results)
                 pil_for_cache = None
@@ -1286,7 +1623,7 @@ class LightmapApp:
                         result_img = np.asarray(pil_tmp).astype(np.float32) / 255.0
                     # decide how to save: HDR extensions -> save as HDR, otherwise tonemap to LDR if enabled
                     if out_path.suffix.lower() in ('.exr', '.hdr', '.pfm'):
-                        _save_any_image(out_path, result_img)
+                        _save_any_image(out_path, result_img, src_meta_path=Path(self.lm_path))
                         # create a tonemapped preview for cache
                         try:
                             strength = float(self.tonemap_strength_var.get())/100.0 if hasattr(self, 'tonemap_strength_var') else 1.0
@@ -1337,7 +1674,7 @@ class LightmapApp:
                         pil_for_cache = pil_out
                     except Exception:
                         try:
-                            _save_any_image(out_path, result_img)
+                            _save_any_image(out_path, result_img, src_meta_path=Path(self.lm_path))
                         except Exception:
                             result_img.save(str(out_path))
                         # convert to PIL preview for cache
