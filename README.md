@@ -23,6 +23,7 @@ I'd be very appreciate if someone who know the Unity lightmap pipeline could cor
 🖼️ Tonemappers : 2 tonemapping methods for color correction which are "ACES & Reinhard" with adjustable options. You can also select "None" if you don't need it.
 ⏰ GPU-Accleration : Only if you have Pytorch. I don't even know if it's working correctly or not.
 📷 Preview : A function for previewing the result before applying. Only for lightmap applying.
+🪒 Resamplers : Seven resamplers for resizing. 
 ```
 
 ## 🔒 Requirements
@@ -60,6 +61,6 @@ That's it. It's simple tool. But, as I've mentioned above. **Feel free to fork t
 - Sometimes, the result won't be accurate to the Unity. Depending on color space or something that I'm not sure as I'm not a Unity user. But, You can tweak tonemapping to match it much as you can.
 - GPU acceleration might have the same speed as CPU acceleration.
 - Applied results sometimes get artifacts. I fixed it as I can but still. some artifacts.
-- HDR & EXR support needed!
+- ~~HDR & EXR support needed!~~
 
 **65% of the tool is written by a friend and Copilot..**
